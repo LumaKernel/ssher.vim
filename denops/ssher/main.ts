@@ -230,8 +230,6 @@ export async function main(denops: Denops): Promise<void> {
           "1",
           "-maxdepth",
           "1",
-          "-printf",
-          "%f",
           "-exec",
           "sh",
           "-c",
