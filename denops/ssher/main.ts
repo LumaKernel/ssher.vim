@@ -1,10 +1,17 @@
 // deno-lint-ignore-file require-await
 import { path } from "https://deno.land/x/denops_core@v1.0.0/deps.ts";
-import { Denops, fn, streams, unknownutil } from "./deps.ts";
+import { base64, Denops, fmtBytes, fn, streams, unknownutil } from "./deps.ts";
 import * as internal from "./internal_autoload_fn.ts";
+import { StatTypeName, statTypes } from "./stat.ts";
+
+export interface DirInfo {
+  headerLength: number;
+  to: string[];
+}
 
 const bufVarNames = {
   perm: "ssher_perm",
+  dirInfo: "ssher_dir_info",
 };
 
 const dispatcherNames = {
@@ -23,12 +30,29 @@ const normalizePath = (p: string) => {
   return t;
 };
 
-interface Target {
+const joinCommandsInShell = (
+  commands: readonly (readonly string[])[],
+): string[] => {
+  return [
+    "sh",
+    "-c",
+    commands.map((cmd) => toEscapedShellLine(cmd)).join("\n"),
+  ];
+};
+
+const toEscapedShellLine = (cmd: readonly string[]): string => {
+  const escaped = cmd.map((c) => base64.encode(c)).map((b) =>
+    `"$(printf "%s" ${b}|base64 -d)"`
+  ).join(" ");
+  return escaped;
+};
+
+interface SshTarget {
   user: string;
   host: string;
   port?: string;
 }
-const parseTarget = (target: string): Target => {
+const parseSshTarget = (target: string): SshTarget => {
   // user@host:port!i=
   const g = target.match(/^(.*)@(.*)(?::(\d+))?/);
   if (!g) throw new Error("invalid ssher target");
@@ -40,26 +64,8 @@ const parseTarget = (target: string): Target => {
   };
 };
 
-interface Ls {
-  stat: string;
-  path: string;
-}
-const parseLs = (lsStr: string): Ls => {
-  const g = lsStr.match(
-    /^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.*)$/,
-  );
-  if (!g) throw new Error("invalid ssher ls");
-  // drwxr-xr-x  6 luma luma 4.0K 2021-09-18 11:05 vim/
-  const [_, stat, _what, _uname, _gname, _size, _date, _time, pathStr] = g;
-  return {
-    stat,
-    path: pathStr,
-  };
-};
-const lsIsDir = ({ path: p }: Ls) => p.endsWith("/") || p === "";
-
 interface SSHerParams {
-  target: Target;
+  target: SshTarget;
   path: string;
 }
 const parseName = (dri: string): SSHerParams => {
@@ -72,7 +78,7 @@ const parseName = (dri: string): SSHerParams => {
   const targetStr = driPath.slice(0, firstSlashIndex);
   const pathStr = driPath.slice(firstSlashIndex + 1);
   return {
-    target: parseTarget(targetStr),
+    target: parseSshTarget(targetStr),
     path: pathStr,
   };
 };
@@ -84,26 +90,39 @@ const constructName = (
 
 const isDir = ({ path: p }: SSHerParams) => p.endsWith("/") || p === "";
 
-const statToPerm = (statStr: string): string => {
+export interface StatAccess {
+  oct: string;
+  isSymlink: boolean;
+  isDirectory: boolean;
+}
+const parseStatAccess = (statStr: string): StatAccess => {
   const t = (f: number): number => {
     return (statStr[f] !== "-" ? 4 : 0) +
       (statStr[f + 1] !== "-" ? 2 : 0) +
       (statStr[f + 2] !== "-" ? 1 : 0);
   };
-  return `${t(1)}${t(4)}${t(7)}`;
+  return {
+    oct: `${t(1)}${t(4)}${t(7)}`,
+    isSymlink: statStr[0] === "l",
+    isDirectory: statStr[0] === "d",
+  };
 };
 
-const runSsh = (target: Target, cmd: string[]) => {
+const runSsh = (targetStr: SshTarget, cmd: string[]) => {
   return Deno.run({
     cmd: [
       "ssh",
-      `${target.user}@${target.host}`,
-      ...(target.port ? ["-p", target.port] : []),
+      `${targetStr.user}@${targetStr.host}`,
+      ...(targetStr.port ? ["-p", targetStr.port] : []),
       ...cmd,
     ],
     stdin: "piped",
     stdout: "piped",
   });
+};
+
+const runSshShellWithEscape = (targetStr: SshTarget, cmd: string[]) => {
+  return runSsh(targetStr, ["sh", "-c", `'${toEscapedShellLine(cmd)}'`]);
 };
 
 const runScp = async (
@@ -130,79 +149,168 @@ export async function main(denops: Denops): Promise<void> {
     return dri.startsWith(prefix);
   };
 
-  const setupBuffer = async (bufnr: number): Promise<void> => {
-    // await fn.setbufvar(denops, bufnr, "ssher_buffer_loaded", 1);
-    const bufname = await fn.bufname(denops);
-    const params = parseName(bufname);
+  const setupFileBuffer = async (
+    bufnr: number,
+    params: SSHerParams,
+  ): Promise<void> => {
     const p = await (async () => {
-      if (isDir(params)) {
-        return runSsh(params.target, [
-          "ls",
-          "-lFah",
-          "--time-style=long-iso",
-          ...params.path ? [params.path] : [],
-        ]);
-      } else {
-        const p = runSsh(params.target, [
-          "stat",
-          "--format=%A",
-          "--",
-          params.path,
-        ]);
-        const statStr = new TextDecoder().decode(
-          await streams.readAll(p.stdout),
-        ).trim();
-        await fn.setbufvar(
-          denops,
-          bufnr,
-          bufVarNames.perm,
-          statToPerm(statStr),
-        );
-        return runSsh(params.target, ["cat", params.path]);
-      }
+      const tmp = runSsh(params.target, [
+        "stat",
+        "--format=%A",
+        "--",
+        params.path,
+      ]);
+      const statStr = new TextDecoder().decode(
+        await streams.readAll(tmp.stdout),
+      ).trim();
+      await fn.setbufvar(
+        denops,
+        bufnr,
+        bufVarNames.perm,
+        parseStatAccess(statStr).oct,
+      );
+      return runSsh(params.target, ["cat", params.path]);
     })();
 
-    try {
-      let linenr = 1;
-      const lineBuf: number[] = [];
-      const buf = new Uint8Array(65536);
-      let first = true;
-      const proc = async () => {
-        if (first) {
-          await internal.setbufline(
-            denops,
-            bufnr,
-            1,
-            [""],
-          );
+    const lines = new TextDecoder().decode(await streams.readAll(p.stdout))
+      .split("\n");
+    if (lines.length !== 1 && lines.slice(-1)[0] === "") lines.pop();
+    await internal.setbufline(
+      denops,
+      bufnr,
+      1,
+      lines,
+    );
 
-          first = false;
-        }
-        const lines: string[] = [];
-        let s: number;
-        while ((s = lineBuf.indexOf(0x0a)) >= 0) {
-          const line = lineBuf.splice(0, s + 1).slice(0, -1);
-          lines.push(new TextDecoder().decode(Uint8Array.from(line)));
-        }
-        await internal.setbufline(
-          denops,
-          bufnr,
-          linenr,
-          lines,
-        );
-        linenr += lines.length;
-      };
-      while (await p.stdout.read(buf) !== null) {
-        lineBuf.push(...buf);
-        await proc();
+    await fn.execute(denops, "set modifiable");
+  };
+
+  const setupDirBuffer = async (
+    bufnr: number,
+    params: SSHerParams,
+  ): Promise<void> => {
+    const statTypeNames = Object.keys(statTypes) as StatTypeName[];
+    const script = [
+      ...statTypeNames.map((name) => statTypes[name]).map((
+        { format, needEscape, flags },
+      ) =>
+        `stat${flags ? ` ${flags}` : ""} ${
+          needEscape ? "--printf" : "--format"
+        }=${format} -- "$0"${needEscape ? "|base64 -w0;echo" : ""}`
+      ),
+      'readlink -n -f "$0"|base64 -w0;echo',
+    ].join(
+      ";",
+    );
+
+    const p = runSshShellWithEscape(
+      params.target,
+      joinCommandsInShell([
+        [
+          "sh",
+          "-c",
+          script,
+          "..",
+        ],
+        [
+          "sh",
+          "-c",
+          script,
+          ".",
+        ],
+        [
+          "find",
+          ...params.path ? [params.path] : ["."],
+          "-mindepth",
+          "1",
+          "-maxdepth",
+          "1",
+          "-exec",
+          "sh",
+          "-c",
+          script,
+          "{}",
+          ";",
+        ],
+      ]),
+    );
+    const lines = new TextDecoder().decode(await streams.readAll(p.stdout))
+      .trim()
+      .split("\n");
+    type Stat = Record<StatTypeName | "dereferenced", string>;
+    const stats: Stat[] = [];
+    for (let i = 0; i < lines.length;) {
+      const rest = lines.length - i;
+      if (rest < statTypeNames.length) {
+        console.warn("ssher.vim: UNREACHABLE: #1");
+        break;
       }
-      await proc();
-    } finally {
-      p.close();
+      const stat = Object.fromEntries(
+        statTypeNames.map((statTypeName) => {
+          const e: [StatTypeName, string] = [statTypeName, lines[i]];
+          if (statTypes[statTypeName].needEscape) {
+            e[1] = new TextDecoder().decode(base64.decode(e[1]));
+          }
+          i += 1;
+          return e;
+        }),
+      ) as Stat;
+      stat.dereferenced = new TextDecoder().decode(base64.decode(lines[i]));
+      i += 1;
+      stats.push(stat);
     }
+    const formatStat = (
+      { access, userId, groupId, fileName, sizeInBytes, dereferenced }: Stat,
+    ): string => {
+      return [
+        access,
+        fmtBytes.prettyBytes(Number.parseInt(sizeInBytes, 10)),
+        `${userId}:${groupId}`,
+        fileName + (parseStatAccess(access).isDirectory ? "/" : "") + (
+          parseStatAccess(access).isSymlink ? `\t-> ${dereferenced}` : ""
+        ),
+      ].join("\t");
+    };
+    const header = [
+      `Entries fetched at ${new Date().toLocaleString()}.`,
+      `NOTE: Less custimizability. PRs are welcome.`,
+      `-`.repeat(78),
+      `[Enter] Select`,
+      `=`.repeat(78),
+      "",
+    ];
+    await internal.setbufline(
+      denops,
+      bufnr,
+      1,
+      [
+        ...header,
+        ...stats.map((stat) => formatStat(stat)),
+      ],
+    );
 
-    if (!isDir(params)) {
-      await fn.execute(denops, "set modifiable");
+    const dirInfo: DirInfo = {
+      headerLength: header.length,
+      to: stats.map((stat) =>
+        stat.fileName + (parseStatAccess(stat.access).isDirectory ? "/" : "")
+      ),
+    };
+    await fn.setbufvar(
+      denops,
+      bufnr,
+      bufVarNames.dirInfo,
+      dirInfo,
+    );
+    await fn.execute(denops, "setlocal tabstop=12");
+  };
+
+  const setupBuffer = async (bufnr: number): Promise<void> => {
+    const bufname = await fn.bufname(denops);
+    const params = parseName(bufname);
+    if (isDir(params)) {
+      setupDirBuffer(bufnr, params);
+    } else {
+      setupFileBuffer(bufnr, params);
     }
   };
 
@@ -225,17 +333,26 @@ export async function main(denops: Denops): Promise<void> {
     }
   };
 
-  const onEnter = async (): Promise<void> => {
-    const bufname: string = await fn.bufname(denops);
-    const line: string = await fn.getline(denops, ".");
+  const onEnter = async (bufnr: number): Promise<void> => {
+    const bufname: string = await fn.bufname(denops, bufnr);
+    const line = await fn.line(denops, ".") - 1;
     const params = parseName(bufname);
-    const ls = parseLs(line);
+    const dirInfo = await fn.getbufvar(
+      denops,
+      bufnr,
+      bufVarNames.dirInfo,
+    ) as DirInfo;
+    if (line < dirInfo.headerLength) return;
+    const index = line - dirInfo.headerLength;
+    if (index >= dirInfo.to.length) return;
+    const to = dirInfo.to[index];
+
     await fn.execute(
       denops,
       `:e ${
         constructName({
           ...params,
-          path: normalizePath(path.join(params.path ?? "", ls.path)),
+          path: normalizePath(path.join(params.path ?? "", to)),
         })
       }`,
     );
@@ -267,8 +384,9 @@ export async function main(denops: Denops): Promise<void> {
       unknownutil.ensureNumber(bufnr);
       await setupBuffer(bufnr);
     },
-    async [dispatcherNames.ON_ENTER](): Promise<void> {
-      await onEnter();
+    async [dispatcherNames.ON_ENTER](bufnr): Promise<void> {
+      unknownutil.ensureNumber(bufnr);
+      await onEnter(bufnr);
     },
     async [dispatcherNames.ON_SAVE](bufnr, lines): Promise<void> {
       unknownutil.ensureNumber(bufnr);

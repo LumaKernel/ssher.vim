@@ -12,7 +12,7 @@ function! ssher#internal#setup_buffer(bufnr) abort
   set nomodifiable
   let bufname = bufname(a:bufnr)
   if bufname =~# '/$'
-    nnoremap <buffer> <CR> <CMD>call denops#request('ssher', 'onEnter', [])<CR>
+    nnoremap <buffer> <CR> <CMD>call denops#request('ssher', 'onEnter', [bufnr()])<CR>
   else
     autocmd BufWriteCmd <buffer> call denops#request('ssher', 'onSave', [bufnr(), getline(1, '$')])
   endif

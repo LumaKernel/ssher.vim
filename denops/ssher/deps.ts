@@ -6,3 +6,5 @@ export * as fn from "https://deno.land/x/denops_std@v3.0.0/function/mod.ts";
 export * as autocmd from "https://deno.land/x/denops_std@v3.0.0/autocmd/mod.ts";
 export * as vars from "https://deno.land/x/denops_std@v3.0.0/variable/mod.ts";
 export * as streams from "https://deno.land/std@0.125.0/streams/mod.ts";
+export * as base64 from "https://deno.land/std@0.125.0/encoding/base64.ts";
+export * as fmtBytes from "https://deno.land/std@0.126.0/fmt/bytes.ts";
