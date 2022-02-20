@@ -30,6 +30,12 @@ const normalizePath = (p: string) => {
   return t;
 };
 
+const basename = (p: string) => {
+  if (p === ".") return p;
+  if (p === "..") return p;
+  return path.basename(p);
+};
+
 const joinCommandsInShell = (
   commands: readonly (readonly string[])[],
 ): string[] => {
@@ -132,7 +138,6 @@ const runScp = async (
 ) => {
   const basename = path.basename(params.path);
   const p = runSsh(params.target, ["scp", "-qt", "--", params.path]);
-  // const p = runSsh(params.target, ["scp", "-qt", "--", "/home/ec2-user/foo"]);
   await streams.writeAll(
     p.stdin,
     new TextEncoder().encode(`C0${perm} ${data.length} ${basename}\n`),
@@ -225,6 +230,8 @@ export async function main(denops: Denops): Promise<void> {
           "1",
           "-maxdepth",
           "1",
+          "-printf",
+          "%f",
           "-exec",
           "sh",
           "-c",
@@ -266,7 +273,8 @@ export async function main(denops: Denops): Promise<void> {
         access,
         fmtBytes.prettyBytes(Number.parseInt(sizeInBytes, 10)),
         `${userId}:${groupId}`,
-        fileName + (parseStatAccess(access).isDirectory ? "/" : "") + (
+        basename(fileName) + (parseStatAccess(access).isDirectory ? "/" : "") +
+        (
           parseStatAccess(access).isSymlink ? `\t-> ${dereferenced}` : ""
         ),
       ].join("\t");
@@ -291,8 +299,8 @@ export async function main(denops: Denops): Promise<void> {
 
     const dirInfo: DirInfo = {
       headerLength: header.length,
-      to: stats.map((stat) =>
-        stat.fileName + (parseStatAccess(stat.access).isDirectory ? "/" : "")
+      to: stats.map(({ fileName, access }) =>
+        basename(fileName) + (parseStatAccess(access).isDirectory ? "/" : "")
       ),
     };
     await fn.setbufvar(
