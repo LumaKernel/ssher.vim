@@ -188,6 +188,10 @@ export async function main(denops: Denops): Promise<void> {
     );
 
     await fn.execute(denops, "set modifiable");
+    await fn.execute(
+      denops,
+      'exe "doau filetypedetect BufRead " . fnameescape(expand("<afile>:r"))',
+    );
   };
 
   const setupDirBuffer = async (
