@@ -23,6 +23,7 @@ edit ssher://
 
 ## Local requisites
 
+- [denops.vim](https://github.com/vim-denops/denops.vim)
 - `ssh`
 
 ## Remote requisites
